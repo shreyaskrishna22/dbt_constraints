@@ -146,6 +146,33 @@
             "semi_structured_col": { },
             "foreign_keys": { } } -%}
 
+        {#- Precompute two indexes ONCE so the per-test helpers below do O(1) dict
+            lookups instead of re-scanning the whole graph for every test. On large
+            projects (thousands of tests) the original full-graph scans in
+            test_selected / should_always_create_constraint / the table_model
+            resolution dominated run-end wall-clock. Behavior is unchanged -- these
+            indexes just memoize the same traversals.
+            - node_by_id: graph.nodes is already keyed by unique_id, but we expose it
+              explicitly so the helpers can use .get() in place of
+              `graph.nodes.values() | selectattr("unique_id","equalto", id)`.
+            - fk_tests_by_dep: maps a node unique_id -> list of FK/relationships tests
+              that depend on it, so test_selected can find the FKs referencing a PK/UK
+              test's model without scanning every test. -#}
+        {%- set fk_tests_by_dep = {} -%}
+        {%- for fk_model in graph.nodes.values() | selectattr("resource_type", "equalto", "test")
+                if fk_model.test_metadata
+                and fk_model.test_metadata.name in ("foreign_key", "relationships")
+                and fk_model.depends_on
+                and fk_model.depends_on.nodes -%}
+            {%- for dep in fk_model.depends_on.nodes -%}
+                {%- if dep not in fk_tests_by_dep -%}
+                    {%- do fk_tests_by_dep.update({dep: []}) -%}
+                {%- endif -%}
+                {%- do fk_tests_by_dep[dep].append(fk_model) -%}
+            {%- endfor -%}
+        {%- endfor -%}
+        {%- do lookup_cache.update({"node_by_id": graph.nodes, "fk_tests_by_dep": fk_tests_by_dep}) -%}
+
         {%- if 'not_null' in constraint_types and var('dbt_constraints_nn_enabled', "true")|string|lower == "true" -%}
             {%- do dbt_constraints.create_constraints_by_type(['not_null'], quote_columns, lookup_cache) -%}
         {%- endif -%}
@@ -175,7 +202,7 @@
 
 
 {#- This macro checks if a test or its model is selected -#}
-{%- macro test_selected(test_model) -%}
+{%- macro test_selected(test_model, lookup_cache) -%}
 
     {%- if test_model.unique_id in selected_resources -%}
         {{ return("TEST_SELECTED") }}
@@ -207,11 +234,12 @@
         {%- elif pk_test_args.column_name -%}
             {%- set pk_test_columns =  [pk_test_args.column_name] -%}
         {%- endif -%}
-        {%- for fk_model in graph.nodes.values() | selectattr("resource_type", "equalto", "test")
-                if  fk_model.test_metadata
-                and fk_model.test_metadata.name in ("foreign_key", "relationships")
-                and test_model.attached_node in fk_model.depends_on.nodes
-                and ( (fk_model.unique_id and fk_model.unique_id in selected_resources)
+        {#- Only the FK/relationships tests that depend on this PK/UK test's model can
+            match. Pull them from the precomputed fk_tests_by_dep index (keyed by the
+            node unique_id) instead of re-scanning every test in the graph. This keeps
+            the exact same matching logic -- it just narrows the candidate set first. -#}
+        {%- for fk_model in lookup_cache.fk_tests_by_dep.get(test_model.attached_node, [])
+                if ( (fk_model.unique_id and fk_model.unique_id in selected_resources)
                     or (fk_model.attached_node and fk_model.attached_node in selected_resources) ) -%}
             {#- Handle both dbt-core kwargs and Fusion arguments format -#}
             {%- set raw_fk_kwargs = fk_model.test_metadata.kwargs -%}
@@ -272,15 +300,17 @@
 
 
 {#- This macro that checks if a test or its model has always_create_constraint set -#}
-{%- macro should_always_create_constraint(test_model) -%}
+{%- macro should_always_create_constraint(test_model, lookup_cache) -%}
     {%- if test_model.config.get("always_create_constraint", "false")|string|lower == "true"
         or test_model.config.get("meta", {}).get("always_create_constraint", "false")|string|lower == "true" -%}
         {{ return(true) }}
     {%- endif -%}
     {%- for table_node in test_model.depends_on.nodes -%}
-        {%- for node in graph.nodes.values() | selectattr("unique_id", "equalto", table_node)
-            if node.config.get("always_create_constraint", "false")|string|lower == "true"
-            or node.config.get("meta", {}).get("always_create_constraint", "false")|string|lower == "true" -%}
+        {#- Direct dict lookup by unique_id instead of scanning the whole graph. -#}
+        {%- for node in [lookup_cache.node_by_id.get(table_node)]
+            if node is not none
+            and ( node.config.get("always_create_constraint", "false")|string|lower == "true"
+            or node.config.get("meta", {}).get("always_create_constraint", "false")|string|lower == "true" ) -%}
             {{ return(true) }}
         {%- endfor -%}
     {%- endfor -%}
@@ -330,17 +360,17 @@
             {%- set test_parameters = raw_kwargs -%}
         {%- endif -%}
         {%- set test_name = test_model.test_metadata.name -%}
-        {%- set selected = dbt_constraints.test_selected(test_model) -%}
+        {%- set selected = dbt_constraints.test_selected(test_model, lookup_cache) -%}
 
         {#- We can shortcut additional tests if the constraint was not selected -#}
         {%- if selected is not none and dbt_constraints_always_norely -%}
             {#- We can skip checking for NORELY if we always NORELY -#}
             {%- set rely_clause = 'NORELY' -%}
-            {%- set always_create_constraint = dbt_constraints.should_always_create_constraint(test_model) -%}
+            {%- set always_create_constraint = dbt_constraints.should_always_create_constraint(test_model, lookup_cache) -%}
         {%- elif selected is not none -%}
             {#- rely_clause clause will be RELY if a test passed, NORELY if it failed, and '' if it was skipped -#}
             {%- set rely_clause = dbt_constraints.lookup_should_rely(test_model) -%}
-            {%- set always_create_constraint = dbt_constraints.should_always_create_constraint(test_model) -%}
+            {%- set always_create_constraint = dbt_constraints.should_always_create_constraint(test_model, lookup_cache) -%}
         {%- else -%}
             {%- set rely_clause = '' -%}
             {%- set always_create_constraint = false -%}
@@ -363,8 +393,14 @@
 
             {#- Find the table models that are referenced by this test. -#}
             {%- for table_node in test_model.depends_on.nodes -%}
-                {%- for node in graph.nodes.values() | selectattr("unique_id", "equalto", table_node)
-                    if node.config
+                {#- Resolve the dependency node by unique_id via a direct dict lookup
+                    (graph.nodes is keyed by unique_id) instead of scanning every node.
+                    Wrapped in a 1-element list so the original filter conditions below
+                    still apply; the `node is not none` guard replaces the implicit
+                    "no match" behavior of the old selectattr scan. -#}
+                {%- for node in [lookup_cache.node_by_id.get(table_node)]
+                    if node is not none
+                    and node.config
                     and ( node.config.get("materialized", "other") not in ("view", "ephemeral", "dynamic_table")
                         or node.config.get("meta", {}).get("materialized", "other") not in ("view", "ephemeral", "dynamic_table") )
                     and ( node.resource_type in ("model", "snapshot", "seed")
